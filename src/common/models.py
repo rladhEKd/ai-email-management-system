@@ -10,6 +10,7 @@ class Email:
     body_html: Optional[str]
     sender: str
     receivers: List[str]
-    sent_date: datetime.datetime # 또는 datetime 객체
+    sent_date: datetime.datetime
     folder_path: str
+    attachment_text: Optional[str] = None
     thread_topic: Optional[str] = None

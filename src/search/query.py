@@ -9,7 +9,7 @@ from collections import Counter
 from src.ingestion.parser import parse_eml_files
 import operator
 from sentence_transformers import SentenceTransformer
-from sentence_transformers.util import cos_sim
+import chromadb # chromadb 임포트
 
 # --- Helper function to analyze contacts from .eml files ---
 def get_important_contacts(eml_directory):
@@ -55,15 +55,16 @@ def get_important_contacts(eml_directory):
 # -----------------------------------------------------------------------------
 
 class Searcher:
-    def __init__(self, index_dir="data/index", main_user=None, important_contacts=None):
+    def __init__(self, index_dir="data/index", main_user=None, important_contacts=None, chroma_dir="data/chroma"):
         self.index_dir = index_dir
         self.main_user = main_user
         self.important_contacts = important_contacts if important_contacts is not None else set()
+        self.chroma_dir = chroma_dir # ChromaDB 경로 추가
         
         self.ix = None
         self.semantic_model = None
-        self.doc_embeddings = None
-        self.doc_ids = None
+        self.chroma_client = None
+        self.chroma_collection = None
 
         self._open_index()
         self._load_semantic_data()
@@ -79,22 +80,17 @@ class Searcher:
             print(f"Whoosh 색인 파일을 여는 중 오류가 발생했습니다: {e}")
             
     def _load_semantic_data(self):
-        embedding_path = os.path.join(os.path.dirname(self.index_dir), 'embeddings.npy')
-        doc_id_path = os.path.join(os.path.dirname(self.index_dir), 'doc_ids.pkl')
-
-        if not os.path.exists(embedding_path) or not os.path.exists(doc_id_path):
-            print("오류: 시맨틱 검색 데이터(임베딩)를 찾을 수 없습니다.")
+        if not os.path.exists(self.chroma_dir): # ChromaDB 디렉토리 존재 확인
+            print("오류: 시맨틱 검색 데이터(ChromaDB)를 찾을 수 없습니다.")
             print("먼저 'bash -c \"source venv/bin/activate && export PYTHONPATH=$PWD && python3 src/search/indexer.py\"'를 실행하여 색인을 생성해주세요.")
             return
         
         try:
-            print("시맨틱 검색 모델과 데이터를 로드합니다...")
+            print("시맨틱 검색 모델과 ChromaDB를 로드합니다...")
             self.semantic_model = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
-            self.doc_embeddings = np.load(embedding_path)
-            with open(doc_id_path, 'rb') as f:
-                self.doc_ids = pickle.load(f)
-            self.doc_id_to_idx = {doc_id: i for i, doc_id in enumerate(self.doc_ids)}
-            print("시맨틱 데이터 로드를 완료했습니다.")
+            self.chroma_client = chromadb.PersistentClient(path=self.chroma_dir)
+            self.chroma_collection = self.chroma_client.get_collection(name="email_embeddings")
+            print("시맨틱 데이터 로드를 완료했습니다. ChromaDB 문서 수:", self.chroma_collection.count())
         except Exception as e:
             print(f"시맨틱 데이터를 로드하는 중 오류가 발생했습니다: {e}")
 
@@ -111,70 +107,83 @@ class Searcher:
             score += 30
         return score
 
-    def search(self, query_string, search_fields=["subject", "body_plain", "sender"], limit=10, semantic_weight=0.5):
-        if not self.ix or not self.semantic_model:
+    def search(self, query_string, search_fields=["subject", "body_plain", "attachment_text", "sender"], limit=10, semantic_weight=0.5): # search_fields에 attachment_text 추가
+        if not self.ix or not self.semantic_model or not self.chroma_collection:
             print("검색기가 준비되지 않았습니다. 색인 및 시맨틱 데이터가 올바르게 로드되었는지 확인하세요.")
             return []
 
         # --- 1. 독립적인 검색 수행 ---
+        all_candidate_scores = {} # message_id -> {'keyword_score': score, 'semantic_score': score}
+        
         # 1a. Keyword search (Whoosh)
-        keyword_results = {}
-        max_kw_score = 1.0 # 기본값
+        max_kw_score = 0.0
+        print("키워드 검색 (Whoosh)을 수행합니다...")
         try:
             parser = MultifieldParser(search_fields, schema=self.ix.schema)
             query = parser.parse(query_string)
             with self.ix.searcher() as searcher:
-                results = searcher.search(query, limit=30)
+                results = searcher.search(query, limit=None) # 모든 결과 가져오기
                 if results:
-                    max_kw_score = results[0].score # 첫 번째 결과의 점수를 최대값으로 사용
+                    max_kw_score = results[0].score
                     for hit in results:
-                        keyword_results[hit['message_id']] = hit.score
+                        doc_id = hit['message_id']
+                        all_candidate_scores[doc_id] = {'keyword_score': hit.score, 'semantic_score': 0.0}
         except Exception as e:
             print(f"키워드 검색 중 오류 발생: {e}")
 
-        # 1b. Semantic search
-        print("시맨틱 유사도를 계산하는 중...")
-        query_embedding = self.semantic_model.encode(query_string)
-        similarities = cos_sim(query_embedding, self.doc_embeddings)[0]
-        
-        # 상위 N개의 시맨틱 결과 추출
-        top_semantic_indices = np.argsort(-similarities)[:30]
-        semantic_results = {self.doc_ids[i]: similarities[i].item() for i in top_semantic_indices}
-        
-        # --- 2. 결과 병합 및 점수 계산 ---
-        # 두 결과 집합의 모든 문서 ID 가져오기
-        all_doc_ids = set(keyword_results.keys()) | set(semantic_results.keys())
-        
-        combined_results = []
+        # 1b. Semantic search (ChromaDB)
+        print("시맨틱 검색 (ChromaDB)을 수행합니다...")
+        if self.chroma_collection.count() > 0:
+            query_embedding = self.semantic_model.encode([query_string]).tolist()
+            
+            # ChromaDB에서 시맨틱 검색 수행 (상위 50개 정도 가져옴)
+            chroma_results = self.chroma_collection.query(
+                query_embeddings=query_embedding,
+                n_results=min(50, self.chroma_collection.count()),
+                include=['distances'] # IDs와 distances만 필요
+            )
+            
+            if chroma_results and chroma_results['ids']:
+                # ChromaDB의 distance는 L2 distance. 0에 가까울수록 유사.
+                # 유사도 점수로 변환 (1 / (1 + distance))
+                semantic_similarities = {
+                    chroma_results['ids'][0][i]: 1 / (1 + chroma_results['distances'][0][i])
+                    for i in range(len(chroma_results['ids'][0]))
+                }
+                
+                max_sem_similarity = max(semantic_similarities.values()) if semantic_similarities else 0.0
+                
+                for doc_id, sim_score in semantic_similarities.items():
+                    if doc_id not in all_candidate_scores:
+                        all_candidate_scores[doc_id] = {'keyword_score': 0.0, 'semantic_score': 0.0}
+                    all_candidate_scores[doc_id]['semantic_score'] = sim_score / max_sem_similarity if max_sem_similarity > 0 else 0
+
+
+        # --- 2. 결과 병합 및 최종 점수 계산 ---
+        combined_results_list = []
         with self.ix.searcher() as s:
-            for doc_id in all_doc_ids:
-                # 점수 가져오기, 없으면 0
-                kw_score = keyword_results.get(doc_id, 0)
-                sem_score = semantic_results.get(doc_id, 0)
-                
-                # 키워드 점수 정규화
-                normalized_kw_score = kw_score / max_kw_score if max_kw_score > 0 else 0
-                
-                # 문서 필드 가져오기
+            for doc_id, scores in all_candidate_scores.items():
                 fields = s.document(message_id=doc_id)
                 if not fields:
                     continue
+                
+                normalized_kw_score = scores['keyword_score'] / max_kw_score if max_kw_score > 0 else 0
+                normalized_sem_score = scores['semantic_score'] # 이미 정규화된 것으로 간주
 
                 importance_score = self._calculate_importance_score(fields)
                 
-                # 최종 점수 계산
-                hybrid_score = (1 - semantic_weight) * normalized_kw_score + semantic_weight * sem_score
+                hybrid_score = (1 - semantic_weight) * normalized_kw_score + semantic_weight * normalized_sem_score
                 final_score = hybrid_score + (importance_score / 100.0) # 중요도 점수를 보너스로 추가
                 
                 fields['keyword_score'] = normalized_kw_score
-                fields['semantic_score'] = sem_score
+                fields['semantic_score'] = normalized_sem_score
                 fields['hybrid_score'] = hybrid_score
                 fields['final_score'] = final_score
-                combined_results.append(fields)
+                combined_results_list.append(fields)
 
         # --- 3. 최종 결과 정렬 및 반환 ---
-        combined_results.sort(key=lambda x: x['final_score'], reverse=True)
-        return combined_results[:limit]
+        combined_results_list.sort(key=lambda x: x['final_score'], reverse=True)
+        return combined_results_list[:limit]
 
 if __name__ == '__main__':
     if len(sys.argv) < 2:

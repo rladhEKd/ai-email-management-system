@@ -1,14 +1,37 @@
 import os
 import sys
+import io
+import fitz  # PyMuPDF
+import docx
 from email import policy
 from email.parser import BytesParser
 from email.utils import parsedate_to_datetime, getaddresses
 from datetime import datetime
 from src.common.models import Email
 
+def _extract_text_from_pdf(content_bytes):
+    """Extracts text from PDF bytes."""
+    try:
+        with fitz.open(stream=content_bytes, filetype="pdf") as doc:
+            return "".join(page.get_text() for page in doc)
+    except Exception as e:
+        print(f"PDF 텍스트 추출 중 오류 발생: {e}", file=sys.stderr)
+        return ""
+
+def _extract_text_from_docx(content_bytes):
+    """Extracts text from DOCX bytes."""
+    try:
+        stream = io.BytesIO(content_bytes)
+        doc = docx.Document(stream)
+        return "\n".join([para.text for para in doc.paragraphs])
+    except Exception as e:
+        print(f"DOCX 텍스트 추출 중 오류 발생: {e}", file=sys.stderr)
+        return ""
+
 def parse_eml_files(eml_directory):
     """
-    Walks through a directory, parses all .eml files, and yields Email objects.
+    Walks through a directory, parses all .eml files, and yields Email objects,
+    including text from attachments.
     """
     print(f"'{eml_directory}' 디렉터리에서 .eml 파일 파싱을 시작합니다...")
     
@@ -22,7 +45,6 @@ def parse_eml_files(eml_directory):
             file_count += 1
             
             with open(file_path, 'rb') as f:
-                # Use BytesParser with the default policy
                 msg = BytesParser(policy=policy.default).parse(f)
 
             # Extract headers
@@ -32,7 +54,6 @@ def parse_eml_files(eml_directory):
 
             to_tuple = getaddresses(msg.get_all('to', []))
             cc_tuple = getaddresses(msg.get_all('cc', []))
-            
             receivers = [addr for name, addr in to_tuple + cc_tuple]
 
             date_str = msg.get('date')
@@ -44,30 +65,47 @@ def parse_eml_files(eml_directory):
                     sent_date = datetime.now() # Fallback
 
             # Extract body
-            body = ""
+            body_plain = ""
             if msg.is_multipart():
                 for part in msg.walk():
                     ctype = part.get_content_type()
                     cdispo = str(part.get('Content-Disposition'))
                     if ctype == 'text/plain' and 'attachment' not in cdispo:
-                        body = part.get_payload(decode=True).decode('utf-8', errors='ignore')
+                        body_plain = part.get_payload(decode=True).decode('utf-8', errors='ignore')
                         break
             else:
-                body = msg.get_payload(decode=True).decode('utf-8', errors='ignore')
+                body_plain = msg.get_payload(decode=True).decode('utf-8', errors='ignore')
+
+            # Extract attachment text
+            attachment_texts = []
+            if msg.is_multipart():
+                for part in msg.iter_attachments():
+                    content_type = part.get_content_type()
+                    content_bytes = part.get_payload(decode=True)
+                    
+                    if content_bytes is None:
+                        continue
+
+                    if content_type == 'application/pdf':
+                        attachment_texts.append(_extract_text_from_pdf(content_bytes))
+                    elif content_type == 'application/vnd.openxmlformats-officedocument.wordprocessingml.document':
+                        attachment_texts.append(_extract_text_from_docx(content_bytes))
+            
+            attachment_text_combined = "\n".join(filter(None, attachment_texts))
 
             yield Email(
-                message_id=filename, # Use filename as a unique ID
+                message_id=filename,
                 subject=subject,
-                body_plain=body,
+                body_plain=body_plain,
                 body_html=None,
                 sender=sender,
                 receivers=receivers,
                 sent_date=sent_date,
                 folder_path=os.path.basename(root),
+                attachment_text=attachment_text_combined,
                 thread_topic=subject
             )
     print(f"총 {file_count}개의 .eml 파일을 파싱했습니다.")
-
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
