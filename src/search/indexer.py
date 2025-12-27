@@ -1,22 +1,12 @@
 import sys
 import os
-
-# Manually add the project root directory to the Python path
-project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
-if project_root not in sys.path:
-    sys.path.insert(0, project_root)
-
-import sqlite3
-import json
-from whoosh.index import create_in, open_dir
+from whoosh.index import create_in
 from whoosh.fields import Schema, TEXT, DATETIME, ID
-from whoosh.qparser import QueryParser
-from datetime import datetime
-from src.ingestion.storage import SQLiteStorage
+from src.ingestion.parser import parse_eml_files # Import the new EML parser
 
 class EmailIndexer:
-    def __init__(self, db_path="data/emails.db", index_dir="data/index"):
-        self.db_path = db_path
+    def __init__(self, eml_dir="eml_output", index_dir="data/index"):
+        self.eml_dir = eml_dir
         self.index_dir = index_dir
         if not os.path.exists(self.index_dir):
             os.makedirs(self.index_dir)
@@ -34,15 +24,9 @@ class EmailIndexer:
         )
 
     def index_emails(self):
-        print(f"'{self.db_path}'에서 이메일 데이터를 로드 중...")
-        storage = SQLiteStorage(self.db_path)
-        storage.connect()
-        if not storage.conn:
-            print("오류: 데이터베이스 연결에 실패했습니다.")
-            return
-
+        print(f"'{self.eml_dir}'에서 이메일 데이터를 로드하여 색인을 시작합니다...")
+        
         schema = self._create_schema()
-        # 기존 색인이 있으면 삭제하고 새로 생성
         if os.path.exists(self.index_dir):
             import shutil
             shutil.rmtree(self.index_dir)
@@ -51,25 +35,22 @@ class EmailIndexer:
         ix = create_in(self.index_dir, schema)
         writer = ix.writer()
 
+        email_count = 0
         try:
-            cursor = storage.conn.cursor()
-            cursor.execute(
-                "SELECT message_id, subject, body_plain, sender, receivers, sent_date, folder_path, thread_topic FROM emails;"
-            )
-
-            email_count = 0
-            for row in cursor:
-                sent_date_dt = datetime.fromisoformat(row[5]) if row[5] else None
-
+            # Use the EML parser to get email objects
+            for email_obj in parse_eml_files(self.eml_dir):
+                # Convert receivers list to a comma-separated string for Whoosh
+                receivers_str = ",".join(email_obj.receivers) if email_obj.receivers else ""
+                
                 writer.add_document(
-                    message_id=row[0],
-                    subject=row[1] if row[1] else "",
-                    body_plain=row[2] if row[2] else "",
-                    sender=row[3] if row[3] else "",
-                    receivers=row[4] if row[4] else "",
-                    sent_date=sent_date_dt,
-                    folder_path=row[6] if row[6] else "",
-                    thread_topic=row[7] if row[7] else ""
+                    message_id=email_obj.message_id,
+                    subject=email_obj.subject if email_obj.subject else "",
+                    body_plain=email_obj.body_plain if email_obj.body_plain else "",
+                    sender=email_obj.sender if email_obj.sender else "",
+                    receivers=receivers_str,
+                    sent_date=email_obj.sent_date,
+                    folder_path=email_obj.folder_path if email_obj.folder_path else "",
+                    thread_topic=email_obj.thread_topic if email_obj.thread_topic else ""
                 )
                 email_count += 1
 
@@ -78,11 +59,10 @@ class EmailIndexer:
         except Exception as e:
             print(f"이메일 색인 중 오류가 발생했습니다: {e}")
             writer.cancel()
-        finally:
-            storage.close()
 
 if __name__ == '__main__':
-    print("===== Whoosh 검색 색인 구축 시작 =====")
+    print("===== Whoosh 검색 색인 구축 시작 (.eml 기반) =====")
+    # The parser now reads from 'eml_output' by default
     indexer = EmailIndexer()
     indexer.index_emails()
     print("===== Whoosh 검색 색인 구축 완료 =====")

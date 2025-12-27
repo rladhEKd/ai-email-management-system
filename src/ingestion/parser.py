@@ -1,106 +1,90 @@
-import pypff
-import sys
 import os
-import re
+import sys
+from email import policy
+from email.parser import BytesParser
+from email.utils import parsedate_to_datetime, getaddresses
 from datetime import datetime
 from src.common.models import Email
 
-def _parse_recipients_from_headers(headers_string):
+def parse_eml_files(eml_directory):
     """
-    Parses 'To' and 'Cc' recipients from the transport headers string.
-    This is a workaround as pypff doesn't directly expose recipients.
+    Walks through a directory, parses all .eml files, and yields Email objects.
     """
-    if not headers_string:
-        return []
+    print(f"'{eml_directory}' 디렉터리에서 .eml 파일 파싱을 시작합니다...")
     
-    recipients = []
-    # A simple regex to find email addresses
-    email_regex = re.compile(r'[\w\.\-]+@[\w\.\-]+')
-    
-    lines = headers_string.split('\n')
-    for line in lines:
-        line_lower = line.lower()
-        if line_lower.startswith('to:') or line_lower.startswith('cc:'):
-            found_emails = email_regex.findall(line)
-            recipients.extend(found_emails)
+    file_count = 0
+    for root, _, files in os.walk(eml_directory):
+        for filename in files:
+            if not filename.endswith(".eml"):
+                continue
+
+            file_path = os.path.join(root, filename)
+            file_count += 1
             
-    # Remove duplicates and return
-    return list(set(recipients))
+            with open(file_path, 'rb') as f:
+                # Use BytesParser with the default policy
+                msg = BytesParser(policy=policy.default).parse(f)
 
+            # Extract headers
+            subject = msg.get('subject', 'No Subject')
+            sender_tuple = getaddresses([msg.get('from', '')])
+            sender = sender_tuple[0][1] if sender_tuple else 'No Sender'
 
-def message_to_email_object(message, folder_path_str):
-    """
-    pypff message 객체를 Email 데이터 클래스 객체로 변환합니다.
-    """
-    sent_date = message.delivery_time if message.delivery_time else None
-    plain_body = message.plain_text_body.decode('utf-8', errors='ignore') if message.plain_text_body else None
-    html_body = message.html_body.decode('utf-8', errors='ignore') if message.html_body else None
-    
-    # 수정: transport_headers를 파싱하여 수신자 목록을 가져옵니다.
-    receivers = _parse_recipients_from_headers(message.transport_headers)
-    
-    return Email(
-        message_id=message.identifier,
-        subject=message.subject,
-        body_plain=plain_body,
-        body_html=html_body,
-        sender=message.sender_name,
-        receivers=receivers,
-        sent_date=sent_date,
-        folder_path=folder_path_str,
-        thread_topic=message.conversation_topic
-    )
+            to_tuple = getaddresses(msg.get_all('to', []))
+            cc_tuple = getaddresses(msg.get_all('cc', []))
+            
+            receivers = [addr for name, addr in to_tuple + cc_tuple]
 
-def parse_pst_file(pst_file_path):
-    """
-    PST 파일을 열고 모든 메시지를 Email 객체로 변환하여 yield합니다.
-    """
-    if not os.path.exists(pst_file_path):
-        print(f"오류: PST 파일 '{pst_file_path}'를 찾을 수 없습니다.")
-        return
+            date_str = msg.get('date')
+            sent_date = None
+            if date_str:
+                try:
+                    sent_date = parsedate_to_datetime(date_str)
+                except Exception:
+                    sent_date = datetime.now() # Fallback
 
-    pst_file = None
-    try:
-        pst_file = pypff.file()
-        pst_file.open(pst_file_path)
-        yield from _traverse_folders(pst_file.get_root_folder())
-    except Exception as e:
-        print(f"오류: PST 파일을 처리하는 중 문제가 발생했습니다: {e}")
-    finally:
-        if pst_file:
-            pst_file.close()
+            # Extract body
+            body = ""
+            if msg.is_multipart():
+                for part in msg.walk():
+                    ctype = part.get_content_type()
+                    cdispo = str(part.get('Content-Disposition'))
+                    if ctype == 'text/plain' and 'attachment' not in cdispo:
+                        body = part.get_payload(decode=True).decode('utf-8', errors='ignore')
+                        break
+            else:
+                body = msg.get_payload(decode=True).decode('utf-8', errors='ignore')
 
-def _traverse_folders(folder, path_parts=[]):
-    """
-    재귀적으로 폴더를 순회하며 메시지를 Email 객체로 yield합니다.
-    """
-    if not folder:
-        return
-    
-    current_path_parts = path_parts + [folder.get_name() or ""]
-    folder_path_str = "/".join(current_path_parts)
-    
-    for message in folder.sub_messages:
-        yield message_to_email_object(message, folder_path_str)
+            yield Email(
+                message_id=filename, # Use filename as a unique ID
+                subject=subject,
+                body_plain=body,
+                body_html=None,
+                sender=sender,
+                receivers=receivers,
+                sent_date=sent_date,
+                folder_path=os.path.basename(root),
+                thread_topic=subject
+            )
+    print(f"총 {file_count}개의 .eml 파일을 파싱했습니다.")
 
-    for sub_folder in folder.sub_folders:
-        yield from _traverse_folders(sub_folder, current_path_parts)
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("사용법: python3 -m src.ingestion.parser <PST_파일_경로>")
+        print("사용법: python3 -m src.ingestion.parser <eml_디렉터리_경로>")
         sys.exit(1)
     
-    pst_path = sys.argv[1]
+    eml_dir = sys.argv[1]
     
-    print("PST 파싱 테스트 시작...")
-    email_generator = parse_pst_file(pst_path)
+    print("EML 파싱 테스트 시작...")
+    email_generator = parse_eml_files(eml_dir)
     
-    for i, email_obj in enumerate(email_generator):
-        if i >= 5:
-            print("\n... (테스트 종료, 더 많은 메시지가 있을 수 있음)")
-            break
-        print(f"\n--- Email Object {i+1} ---")
-        print(email_obj)
+    if email_generator:
+        for i, email_obj in enumerate(email_generator):
+            if i >= 5:
+                print("\n... (테스트 종료, 더 많은 메시지가 있을 수 있음)")
+                break
+            print(f"\n--- Email Object {i+1} ---")
+            print(email_obj)
         
-    print("\nPST 파싱 테스트 종료.")
+    print("\nEML 파싱 테스트 종료.")
