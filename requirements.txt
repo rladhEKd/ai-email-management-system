@@ -39,3 +39,5 @@ tzdata==2025.3
 urllib3==2.6.2
 watchdog==6.0.0
 Whoosh==2.7.4
+sentence-transformers==2.2.2
+huggingface-hub==0.17.3
